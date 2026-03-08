@@ -3,21 +3,14 @@ from discord.ext import commands
 from discord import app_commands
 
 import os
-TOKEN = os.getenv("TOKEN")
+TOKEN = os.environ.get("TOKEN")
 
 PUBLIC_CHANNEL_ID = 1478764708830908590
 TEST_GUILD_ID = 1244340511276400791
 ROLE_ID = 1478149219947778250
-NOTIFY_ROLE_ID = 1478149219947778250
+NOTIFY_ROLE_ID = 1478149219947778250 # пока не используем (для авторассылки)
 COLLECTOR_ROLE_ID = 1479441246018736239
 ADMIN_ROLE_ID = 1273664375865085974
-
-# АЙДИ ДАЛБАЕБАВ
-BARVAN_ID = 1145099819359154187
-SAKAL_ID = 465874338638200843
-NIKITA_ID = 645094081219002399
-SASHA_ID = 1299736588871270482
-SVINKA_ID = 914673555898265651
 
 # Кастомные эмодзи
 EMOJI_ATT = "<:att:1479275978596417789>"
@@ -50,13 +43,15 @@ class CollectView(discord.ui.View):
         self.limit = limit
         self.war_time = war_time
         self.war_type = war_type
-        self.users = {}
+        self.players = {}
+        self.substitutes = {}
+        self._pending_remove = None
 
-    def build_user_list(self):
+    def build_user_list(self, users_dict):
 
         users_data = []
 
-        for user_id, mention in self.users.items():
+        for user_id, mention in users_dict.items():
 
             member = None
 
@@ -81,7 +76,7 @@ class CollectView(discord.ui.View):
 
         lines = [f"{i+1}. {mention}" for i, (_, mention, tier) in enumerate(users_data)]
 
-        return "\n".join(lines)
+        return "\n".join(lines) if lines else ""
 
 
     def build_embed(self):
@@ -97,9 +92,24 @@ class CollectView(discord.ui.View):
         embed.add_field(name="Формат", value=f"{self.limit}x{self.limit}", inline=True)
         embed.add_field(name="⏰ Время", value=self.war_time, inline=True)
         embed.add_field(name="\n━━━━━━━━━━━━━━━━\n", value="", inline=False)
-        user_list = self.build_user_list() if self.users else ""
-        embed.add_field(name="👥 Участники", value=user_list, inline=False)
-        embed.set_footer(text=f"Записалось: {len(self.users)}/{self.limit}")
+
+        players_list = self.build_user_list(self.players)
+        subs_list = self.build_user_list(self.substitutes)
+
+        embed.add_field(
+            name=f"👥 Участники ({len(self.players)}/{self.limit})",
+            value=f"{players_list}\n\u200b",
+            inline=True
+        )
+
+        embed.add_field(
+            name=f"🔁 Замена ({len(self.substitutes)})",
+            value=subs_list,
+            inline=False
+        )
+
+        embed.set_footer(text=f"Всего записано: {len(self.players)+len(self.substitutes)}")
+
         return embed
 
 
@@ -112,21 +122,21 @@ class CollectView(discord.ui.View):
 
         user = interaction.user
 
-        if user.id in self.users:
+        if user.id in self.players or user.id in self.substitutes:
             await interaction.response.send_message("Ты уже записан", ephemeral=True)
             return
 
-        if len(self.users) >= self.limit:
-            await interaction.response.send_message("Лимит уже достигнут", ephemeral=True)
-            return
-
-        self.users[user.id] = user.mention
+        if len(self.players) < self.limit:
+            self.players[user.id] = user.mention
+        else:
+            self.substitutes[user.id] = user.mention
 
         await interaction.response.edit_message(embed=self.build_embed(), view=self)
 
 
     @discord.ui.button(label="Выписаться", style=discord.ButtonStyle.red)
     async def leave(self, interaction: discord.Interaction, button: discord.ui.Button):
+        promoted_user = None
 
         if not interaction.guild:
             await interaction.response.send_message("Команда только для сервера", ephemeral=True)
@@ -134,13 +144,132 @@ class CollectView(discord.ui.View):
 
         user = interaction.user
 
-        if user.id not in self.users:
+        if user.id not in self.players and user.id not in self.substitutes:
             await interaction.response.send_message("Ты не записан", ephemeral=True)
             return
 
-        del self.users[user.id]
+        # если был в основном составе
+        if user.id in self.players:
+
+            del self.players[user.id]
+
+            if self.substitutes:
+                first_sub_id = next(iter(self.substitutes))
+                first_sub_mention = self.substitutes[first_sub_id]
+
+                self.players[first_sub_id] = first_sub_mention
+                del self.substitutes[first_sub_id]
+
+                promoted_user = first_sub_mention
+
+        # если был в замене
+        elif user.id in self.substitutes:
+            del self.substitutes[user.id]
 
         await interaction.response.edit_message(embed=self.build_embed(), view=self)
+
+        if promoted_user:
+            await interaction.followup.send(
+                f"[✈] {promoted_user} перешёл из замены в основной список!"
+            )
+
+    @discord.ui.button(label="Управление участниками", style=discord.ButtonStyle.blurple)
+    async def manage_members(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # Проверка прав
+        if not any(role.id in [ADMIN_ROLE_ID, COLLECTOR_ROLE_ID] for role in interaction.user.roles):
+            await interaction.response.send_message("❌ У тебя нет прав для управления участниками.", ephemeral=True)
+            return
+
+        if not self.players:
+            await interaction.response.send_message("❌ В основном составе нет игроков для выписки.", ephemeral=True)
+            return
+        if not self.substitutes:
+            await interaction.response.send_message("❌ В замене нет игроков для добавления.", ephemeral=True)
+            return
+
+        self._pending_remove = None
+
+        view = discord.ui.View(timeout=None)
+
+        # Цветные эмодзи для тир
+        role_emojis = {
+            1480010341843730698: "🔴 [T1]",  # T1
+            1480010348756074537: "🔵 [T2]",  # T2
+            1480010349141819492: "⚪ [T3]",  # T3
+        }
+
+        # --- Меню для удаления из основного состава ---
+        remove_options = [
+            discord.SelectOption(
+                label=f"{interaction.guild.get_member(uid).name} - {role_emojis.get(next((r.id for r in interaction.guild.get_member(uid).roles if r.id in role_tiers), None), 'ɴᴏ ᴛɪᴇʀ')}",
+                value=str(uid)
+            )
+            for uid in self.players
+        ]
+        remove_select = discord.ui.Select(
+            placeholder="Выбери участника для выписки",
+            options=remove_options,
+            min_values=1,
+            max_values=1
+        )
+        view.add_item(remove_select)
+
+        # --- Меню для добавления из замены ---
+        add_options = [
+            discord.SelectOption(
+                label=f"{interaction.guild.get_member(uid).name} - {role_emojis.get(next((r.id for r in interaction.guild.get_member(uid).roles if r.id in role_tiers), None), 'ɴᴏ ᴛɪᴇʀ')}",
+                value=str(uid)
+            )
+            for uid in self.substitutes
+        ]
+        add_select = discord.ui.Select(
+            placeholder="Выбери участника для добавления",
+            options=add_options,
+            min_values=1,
+            max_values=1
+        )
+        view.add_item(add_select)
+
+        # --- Коллбек для удаления ---
+        async def remove_callback(interact: discord.Interaction):
+            self._pending_remove = int(remove_select.values[0])
+            await interact.response.send_message(
+                f"✅ Выбран для выписки: {interaction.guild.get_member(self._pending_remove).mention}",
+                ephemeral=True
+            )
+
+        # --- Коллбек для добавления ---
+        async def add_callback(interact: discord.Interaction):
+            if self._pending_remove is None:
+                await interact.response.send_message("❌ Сначала выбери кого выписать.", ephemeral=True)
+                return
+
+            add_id = int(add_select.values[0])
+            remove_id = self._pending_remove
+
+            removed_member = interact.guild.get_member(remove_id)
+            added_member = interact.guild.get_member(add_id)
+
+            # Обмен участников
+            self.players[add_id] = self.substitutes.pop(add_id)
+            self.substitutes[remove_id] = self.players.pop(remove_id)
+
+            self._pending_remove = None  # сброс
+
+            # Обновляем embed (цвет роли останется в embed)
+            await interaction.message.edit(embed=self.build_embed(), view=self)
+            await interaction.followup.send(
+                f"[❗] {added_member.mention} заменил {removed_member.mention}!",
+            )
+
+        remove_select.callback = remove_callback
+        add_select.callback = add_callback
+
+        await interaction.response.send_message(
+            "Выбери участника для выписки и добавления (тир показан через эмодзи):",
+            view=view,
+            ephemeral=True
+        )
 
 
 @bot.event
@@ -207,20 +336,6 @@ async def send_collect(interaction, limit: int, time: str, war_type: str):
     #             await member.send(embed=dm_embed)
     #         except discord.Forbidden:
     #             pass
-
-    try:
-        user1 = await bot.fetch_user(BARVAN_ID)
-        user2 = await bot.fetch_user(SAKAL_ID)
-        user3 = await bot.fetch_user(NIKITA_ID)
-        user4 = await bot.fetch_user(SASHA_ID)
-        user5 = await bot.fetch_user(SVINKA_ID)
-        await user1.send(f"https://media.discordapp.net/attachments/1026907701114052749/1244745339685175418/IMG_20240527_081413.gif?ex=69abde2f&is=69aa8caf&hm=b9ed697ae841dbaad4314f1312afa1093fecedc5c191f6664d469336bd897d55&=&width=739&height=986")
-        await user2.send(f"https://media.discordapp.net/attachments/1026907701114052749/1244745339685175418/IMG_20240527_081413.gif?ex=69abde2f&is=69aa8caf&hm=b9ed697ae841dbaad4314f1312afa1093fecedc5c191f6664d469336bd897d55&=&width=739&height=986")
-        await user3.send(f"https://media.discordapp.net/attachments/1026907701114052749/1244745339685175418/IMG_20240527_081413.gif?ex=69abde2f&is=69aa8caf&hm=b9ed697ae841dbaad4314f1312afa1093fecedc5c191f6664d469336bd897d55&=&width=739&height=986")
-        await user4.send(f"https://media.discordapp.net/attachments/1026907701114052749/1244745339685175418/IMG_20240527_081413.gif?ex=69abde2f&is=6969aa8caf&hm=b9ed697ae841dbaad4314f1312afa1093fecedc5c191f6664d469336bd897d55&=&width=739&height=986")
-        await user5.send(f"https://media.discordapp.net/attachments/1026907701114052749/1244745339685175418/IMG_20240527_081413.gif?ex=69abde2f&is=6969aa8caf&hm=b9ed697ae841dbaad4314f1312afa1093fecedc5c191f6664d469336bd897d55&=&width=739&height=986")
-    except discord.Forbidden:
-        pass
 
     await interaction.followup.send("Сбор опубликован", ephemeral=True)
 
